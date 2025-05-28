@@ -1,0 +1,871 @@
+---
+title: "Ski Lift Problem"
+author: "Yves Lacerte"
+date: "`r Sys.Date()`"
+output: 
+  flexdashboard::flex_dashboard:
+    theme: cosmo
+    vertical_layout: fill
+    orientation: rows
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+
+library(dplyr)
+library(simmer)
+library(simmer.plot)
+library(ggplot2)
+library(kableExtra)
+library(igraph)
+library(queueing)
+
+
+# A ski lift problem.
+# The ski lift is tuned to handle the usual incoming rate of skiers.
+# the mountain has been improved. The ski-able area is larger.
+# More skiers are anticipated. 
+# Waiting line at the ski lift is expected to be longer.
+# How do we tune the ski lift. 
+
+# The model is a simple tandem queues, i.e. from lift to ski. 
+# Arrivals at the lift, and exit at the end of the ski run
+
+# The queueing package, useful for Open Jackson Networks (OJN)
+#   define a transition probability matrix (prob)
+#   define MMc queues ... NewInput.MMC( lambda,  mu1,  CP1)
+#   define an OJN network ... NewInput.OJN(prob, queue1, queue2)
+#   run the model ... QueueingModel()
+#   print summary
+
+
+# The simmer package
+# seize, timeout, and release
+  # A skier is trying to 'seize' the lift 
+  ## 1) access the lift immediately if there is enough capacity
+  ## 2) wait in the queue if there is no room in the lift but 
+  ###   there is room in the queue, 
+  ## 3) rejected if there is no room in the queue
+  # timeout ... Service times have an exponential distribution 
+  # with rate parameter ??. 1/?? is the mean service time
+  # 'release' the resource once the skier is on the lift
+
+# add_generator specifies the inter-arrival rate for an M/M/1 queue
+
+
+library(dplyr)
+library(simmer)
+library(simmer.plot)
+library(ggplot2)
+library(igraph)
+library(queueing)
+
+
+SystemConfiguration <- data.frame(value=rbind(
+  # finely tuned so that wait lines and 
+  # resource utilization are very reasonable
+  
+  'sim time' = 100,             # simulation time
+  'inter-arrival rate' = 7,     # inter-arrival time of skiers
+  
+  # lift queue specs (M/M/c)
+  'lift time' = 10,             # lift mean service time
+  'lift queue' = Inf,           # lift queue size
+  'lift capacity' = 1,          # lift capacity (no. of servers)
+  
+  # ski queue specs (M/M/c)
+  'ski time' = 15,              # ski mean service time
+  'ski queue' = Inf,            # ski queue size
+  'ski capacity' = 1            # ski capacity (no. of servers)
+))
+
+
+RUN <- function(SystemConfiguration) {
+
+  # inter-arrival
+    lambda <- SystemConfiguration["inter-arrival rate",1]
+
+  # lift
+    mu1 <- SystemConfiguration["lift time",1]
+    CP1 <- SystemConfiguration["lift capacity",1]
+    QS1 <- SystemConfiguration['lift queue',1]
+
+  # ski run
+    mu2 <- SystemConfiguration["ski time",1]
+    CP2 <- SystemConfiguration["ski capacity",1]
+    QS2  <- SystemConfiguration['ski queue',1]
+
+
+  # queuing package
+    data <- c(0, 1, 0, 0)
+    prob <- matrix(data=data, byrow = TRUE, nrow = 2, ncol=2)
+    rownames(prob) <- c("lift", "run")
+    colnames(prob) <- rownames(prob)
+
+#    graph.model <- graph_from_adjacency_matrix(prob, mode = "directed", weight=TRUE )
+
+
+    lift <- NewInput.MMC( lambda,  mu1,  CP1)
+    ski  <- NewInput.MMC( 0,  mu2,  CP2)
+    M <- NewInput.OJN(prob=prob, lift, ski)
+    CheckInput(M)
+    MM <- QueueingModel(M)
+
+    queueing.out <- data.frame(rbind(
+      throughput = c(MM$Throughput, MM$Throughputk),
+      'mean number of customers' = c(MM$L, MM$Lk),
+      'mean time spent in the system'=c(MM$W, MM$Wk),
+      'probability no customers'=c(NA,MM$Pn),
+      utilization=c(NA, MM$ROk)
+    ))
+    colnames(queueing.out) <- c("system", "lift", "ski")
+    
+
+    # simmer package
+
+    SimTime <-   SystemConfiguration['sim time',1]
+    BetweenArrival<- function() rexp(1,lambda)
+    ST1  <- function() rexp(1,mu1) # Lift service time ... M/M/1
+    ST2  <- function() rexp(1,mu2) # Ski run service time ... M/M/1
+
+
+    traj <- trajectory() %>%
+      seize("lift", amount=1) %>%
+      timeout(task=ST1) %>%        # Lift service time
+      release("lift", amount=1) %>% 
+      
+      seize("ski", amount=1) %>%
+      timeout(task=ST1) %>%        # Ski run service time
+      release("ski", amount=1) 
+
+    env <- simmer("Ski Lift") %>%
+      add_resource("lift", capacity=CP1, queue_size=QS1) %>%
+      add_resource("ski", capacity=CP2, queue_size=QS2) %>%
+      add_generator("trajectory", traj, BetweenArrival) %>% 
+      run(SimTime) 
+
+    res <- env %>% get_mon_resources()
+    arr <- env %>% get_mon_arrivals()
+
+#    return(list(graph.model=graph.model, 
+   return(list(
+     queueing.out=queueing.out,
+     sim.trajectory=traj,
+     sim.resources=res,
+     sim.arrivals=arr))
+}
+
+
+
+
+utilization <- function(res) {
+  # utilization = % of time resource is busy
+
+  lift <- res[which(res$resource =="lift"),]
+  mountain <- res[which(res$resource =="ski"),]
+  
+  lift$dt <- dplyr::lead(lift$time) - lift$time  
+  lift$in_use <- lift$dt * lift$server / lift$capacity
+  lift.utilization <- sum(lift$in_use, na.rm = TRUE) / sum(lift$dt, na.rm=TRUE)
+
+  mountain$dt <- dplyr::lead(mountain$time) - mountain$time  
+  mountain$in_use <- mountain$dt * mountain$server / mountain$capacity
+  mountain.utilization <- sum(mountain$in_use, na.rm = TRUE) / sum(mountain$dt, na.rm=TRUE)
+
+  df <- data.frame(
+    name=c("lift", "ski"),
+    value=c(lift.utilization, mountain.utilization)
+  )
+
+  p <- ggplot(data=df, aes(value, name, fill=name)) + 
+    geom_col() + 
+    geom_text(aes(label = paste(round(value*100,0),"%" )),
+              nudge_x = -.1) + 
+    xlab("") + ylab("") +
+    theme(legend.position="none")
+
+  return(list(df=df, p=p))
+}
+
+
+activity <- function(res, parameters) {
+  # resource activities
+  
+  data <- res %>% 
+    tidyr::gather("item", "value", c("queue", "server", "system")) %>%
+    dplyr::mutate(item = factor(item)) %>%
+    dplyr::group_by(resource, item) %>%
+    dplyr::mutate(mean = c(0, cumsum(utils::head(value, -1) * diff(time))) / time) %>%
+    dplyr::ungroup()
+
+
+  data.lift <- data[which(data$resource == "lift"),]
+  data.mountain <- data[which(data$resource == "ski"),]
+
+  CP1 <- parameters['lift capacity',1]
+  p.lift <- ggplot(data=data.lift, 
+                   aes(x=time, y=mean, color=item)) + 
+    ylab("lift activity") +
+    geom_line() +
+    geom_hline(yintercept=CP1, linewidth=2, col = 'red')
+
+  
+  
+  CP2 <- parameters['ski capacity',1]
+  p.mountain <- ggplot(data=data.mountain, 
+                       aes(x=time, y=mean, color=item)) + 
+    ylab("mountain activity") +
+    geom_line() +
+    geom_hline(yintercept=CP2, linewidth=2, col = 'red')
+
+
+  lift.T <- data.lift[which(data.lift$item == "system"),]
+  lift.T <- lift.T[nrow(lift.T),]
+
+  lift.S <- data.lift[which(data.lift$item == "server"),]
+  lift.S <- lift.S[nrow(lift.S),]
+
+  lift.Q <- data.lift[which(data.lift$item == "queue"),]
+  lift.Q <- lift.Q[nrow(lift.Q),]
+
+  mountain.T <- data.mountain[which(data.mountain$item == "system"),]
+  mountain.T <- mountain.T[nrow(mountain.T),]
+
+  mountain.S <- data.mountain[which(data.mountain$item == "server"),]
+  mountain.S <- mountain.S[nrow(mountain.S),]
+
+  mountain.Q <- data.mountain[which(data.mountain$item == "queue"),]
+  mountain.Q <- mountain.Q[nrow(mountain.Q),]
+
+  df <- data.frame(rbind(
+    system=c(lift=lift.T$mean, mountain=mountain.T$mean),
+    server=c(lift=lift.S$mean, mountain=mountain.S$mean),
+    queue=c(lift=lift.Q$mean, mountain=mountain.Q$mean)
+  ))
+  
+  return(list(p.lift=p.lift, p.mountain=p.mountain, df=df))
+
+}
+
+
+
+skiers <- function(arr) {
+  # skiers statistics
+
+# number of skiers served over a day
+  N <- data.frame('number of skiers'=nrow(arr))
+
+  arr$flow_time <- arr$end_time - arr$start_time
+  arr$waiting_time = arr$flow_time - arr$activity_time
+
+  
+# waiting time 
+#  summary(arr$end_time-arr$start_time-arr$activity_time)
+  mean.wait <- mean(arr$end_time-arr$start_time-arr$activity_time)
+  p.wait <- ggplot(data=arr, aes(x=end_time, y=waiting_time)) + 
+    ylab("waiting time") + 
+    stat_smooth() +
+    geom_line(alpha=.3) 
+  
+# time in the system 
+#  summary(arr$end_time-arr$start_time)
+  mean.in <- mean(arr$end_time-arr$start_time)
+  p.in <- ggplot(data=arr, aes(x=end_time, y=flow_time)) + 
+    ylab("flow time") + 
+    stat_smooth() +
+    geom_line(alpha=.3) 
+  
+# activity time in the system 
+#  summary(arr$activity_time)
+  mean.act <- mean(arr$activity_time)
+  p.act <- ggplot(data=arr, aes(x=end_time, y=activity_time)) + 
+    ylab("activity time") + 
+    stat_smooth() +
+    geom_line(alpha=.3) 
+
+  df <- data.frame(value=rbind(
+    'mean wait time'=mean.wait,
+    'mean time in system'=mean.in,
+    'mean activity time'=mean.act))
+  
+  return(list(N=N, df=df, p.wait=p.wait, p.in=p.in, p.act=p.act))
+}  
+
+
+
+  
+test <- function() {
+  
+  out <- RUN(SystemConfiguration)
+  
+#  plot(out$graph.model, 
+#       edge.label=E(g)$weight, 
+#       vertex.size=155, 
+#       vertex.label.cex=2,
+#       edge.label.cex=2,
+#  )
+  out$queuing.system %>% kbl() %>% kable_styling()
+  out$queuing.nodes %>% kbl() %>% kable_styling()
+  
+  
+  
+  res <- out$sim.resources
+  arr <- out$sim.arrivals
+  plot(out$sim.trajectory)
+  
+  plot(res, metric = "utilization")
+  plot(res, metric = "usage")
+  plot(arr, metric = "activity_time")
+  plot(arr, metric = "waiting_time")
+  plot(arr, metric = "flow_time")
+  
+  utilization(res)$df %>% kbl() %>% kable_styling()
+  utilization(res)$p
+  
+  
+  data <- activity(res, parameters=SystemConfiguration)$df
+  data %>% kbl() %>% kable_styling()
+  activity(res, SystemConfiguration)$p.lift
+  activity(res, SystemConfiguration)$p.mountain
+  
+  
+  skiers(arr)$N %>% kbl(align='l') %>% kable_styling()
+  skiers(arr)$df %>% kbl() %>% kable_styling()
+  
+  skiers(arr)$p.wait
+  skiers(arr)$p.in
+  skiers(arr)$p.act
+  
+}
+
+
+
+RV <- reactiveValues()
+
+RV$out <- RUN(SystemConfiguration)
+RV$SystemConfiguration <- SystemConfiguration
+
+```
+
+<b>0</b> {data-icon="fa-hockey-puck"}
+=====================================  
+
+Column {}
+-------------------------------------
+### <b></b>
+```{r, echo=FALSE}  
+knitr::include_graphics("C:/Users/ylace/OneDrive/Desktop/STUFF/Ski Lift/LongLines.png")
+```
+
+Row {data-height=200}
+-------------------------------------
+### <b>Motivation</b>
+We have seen long lift lines at ski resorts. The ski-lift waiting time is one of the main indicators to evaluate a ski area. Lift capacity and the frequency of its arrival define the dynamic capacity of the ski lift.
+
+Mountain geographical data, skier arrival pattern, slopes, skier categories, demographic distribution, and chairlift characteristic are used to build mathematical and simulation models to determine the type, the number, and the
+layout of lifts that will minimize wait times and reduce development and operation cost of the ski resort.
+
+Herein, I develop a simple queueing model. Because the model is simple, I get exact answers. I also simulate the model, which is beneficial when the model gets more complex. Finally, I discuss the necessary next steps that will lead to a decision.
+
+The tool is a R shiny application, which can be retrieved at https://github.com/ylacerte/Ski-Lift/
+
+<b>1</b> {data-icon="fa-hockey-puck"}
+=====================================  
+
+Row {data-height=200}
+-------------------------------------
+
+### <b></b>
+
+A ski resort has one lift. The system is tuned to handle the usual incoming rate of skiers. The mountain has been improved, the ski-able area is larger. More skiers are anticipated. The waiting time at the ski lift is expected to be longer. How do we tune the ski lift?
+
+Let's model the system as follows. The system is made up of two queues in tandem. The first queue (M/M/c) is the lift. Skiers arrive at the lift and may have to wait to get on. A the top of the lift, there is a ski queue (also M/M/c) where skiers may have to wait before skiing down the mountain. Skiers leave the system after they have skied to the bottom. 
+
+ 
+
+Row {}
+-------------------------------------
+
+### <b>ski resort model</b>
+```{r, echo=FALSE}  
+
+library(ggraph)
+library(tidygraph)
+library(igraph)
+arcs <- data.frame(rbind(
+  c(from=1, to=2, label = "inter-arrival rate"),
+  c(from=2, to=3, label = "queue\n(capacity, time)"),
+  c(from=3, to=4, label = "queue\n(capacity, time)")
+))
+nodes <- data.frame(rbind(
+  c(node=0, label="arriving skiers"),
+  c(node=1, label="waiting line"),
+  c(node=2, label="ski lift"),
+  c(node=3, label="top of mountain")
+))
+
+ggraph(arcs) +
+  theme(legend.position = "none", 
+        panel.background = element_rect(fill = "white",
+                                        colour = "white",
+                                        size = 0.5, linetype = "solid")) +
+  geom_edge_fan(aes(label = label), 
+    color='grey9', alpha=.9,
+    arrow = arrow(length = unit(4, 'mm')),
+    end_cap = circle(4, 'mm'),
+    label_pos=.3) +
+  geom_node_point() +
+  geom_node_label(aes(label = nodes$label)) 
+
+```
+
+### <b>Default system configuration</b>
+```{r, echo=FALSE}
+SystemConfiguration %>% kbl(align=c('l','l')) %>% kable_styling()
+```
+
+
+<b>2</b> {data-icon="fa-hockey-puck"}
+=====================================  
+
+Row {}
+-------------------------------------
+
+### <b>Modify default system configuration</b>
+```{r, echo=FALSE}
+
+tags$div(numericInput("inter_arrival", 
+                      HTML("<b>inter-arrival rate</b><br>"), 
+                      SystemConfiguration["inter-arrival rate",1]), 
+         style="width: 50%; display:inline-block")
+HTML("<br>")
+
+tags$div(numericInput("time_on_lift", 
+                      HTML("<b>lift time</b><br>"), 
+                      SystemConfiguration["lift time",1]), 
+         style="width: 30%; display:inline-block")
+
+tags$div(numericInput("lift_capacity", 
+                      HTML("<b>lift capacity</b><br>"), 
+                      SystemConfiguration["lift capacity",1]), 
+         style="width: 30%; display:inline-block")
+HTML("<br>")
+
+
+tags$div(numericInput("time_on_mountain", 
+                      HTML("<b>ski time</b><br>"), 
+                      SystemConfiguration["ski time",1]), 
+         style="width: 30%; display:inline-block")
+
+
+tags$div(numericInput("mountain_capacity", 
+                      HTML("<b>ski capacity</b><br>"), 
+                      SystemConfiguration["ski capacity",1]), 
+         style="width: 30%; display:inline-block")
+
+HTML("<br>")
+tags$div(actionButton("reset", 
+                      HTML("<b>reset</b>")), 
+         style="width: 35%; display:inline-block")
+
+tags$div(actionButton("SIM", 
+                      HTML("<b>run</b>")), 
+     style="width: 25%; display:inline-block")
+
+HTML("<br><br>One would normally run the simulation many times to get expected values.")
+```
+
+
+### <b>Queueing package</b>
+
+```{r, echo=FALSE}
+renderUI({
+  data <- round(RV$out$queueing.out,2)
+  HTML(data %>% kbl(align='l') %>% kable_styling(font_size=14))
+})
+```
+
+```{r, echo=FALSE}
+observeEvent(input$reset,{
+  updateNumericInput(session,"inter_arrival", 
+                     value=SystemConfiguration["inter-arrival rate",1])
+  updateNumericInput(session,"time_on_lift", 
+                     value=SystemConfiguration["lift time",1])
+  updateNumericInput(session,"lift_capacity", 
+                     value=SystemConfiguration["lift capacity",1])
+  updateNumericInput(session,"time_on_mountain", 
+                     value=SystemConfiguration["ski time",1])
+  updateNumericInput(session,"mountain_capacity", 
+                     value=SystemConfiguration["ski capacity",1])
+})
+```
+
+```{r, echo=FALSE}
+observeEvent(input$SIM,{
+  RV$SystemConfiguration['inter-arrival rate',1] <- input$inter_arrival
+  RV$SystemConfiguration['lift time',1] <- input$time_on_lift
+  RV$SystemConfiguration['lift capacity',1] <- input$lift_capacity
+  RV$SystemConfiguration['ski time',1] <- input$time_on_mountain
+  RV$SystemConfiguration['ski capacity',1] <- input$mountain_capacity
+  
+#  print("observeEvent(input$SIM)")
+#  print(RV$SystemConfiguration)
+
+  RV$out <- RUN(RV$SystemConfiguration)
+#  print(str(RV$out))
+  
+})
+```
+
+```{r, echo=FALSE}
+```
+
+
+### <b>Lift</b>
+```{r, echo=FALSE}
+renderPlot({
+  if ( ! is.null(RV$out) ) {
+    res <- RV$out$sim.resources
+    activity(res, RV$SystemConfiguration)$p.lift
+  }
+})
+```
+
+
+### <b>Mountain</b>
+```{r, echo=FALSE}
+renderPlot({
+
+  if ( ! is.null(RV$out) ) {
+    res <- RV$out$sim.resources
+    activity(res, RV$SystemConfiguration)$p.mountain
+  }
+})
+```
+
+
+
+Row {data-height=250}
+-------------------------------------
+
+### <b>Number of skiers</b>
+```{r, echo=FALSE}
+renderUI({
+  if ( ! is.null(RV$out) ) {
+    arr <- RV$out$sim.arrivals
+    HTML(skiers(arr)$N %>% kbl(align='l') %>% kable_styling(font_size=14))
+  }
+})
+```
+
+### <b>Utilization (%)</b>
+```{r, echo=FALSE}
+renderPlot({
+  if ( ! is.null(RV$out) ) {
+    res <- RV$out$sim.resources
+    utilization(res)$p
+  }
+})
+```
+
+### <b>Resource activity</b>
+```{r, echo=FALSE}
+renderUI({
+  if ( ! is.null(RV$out) ) {
+    res <- RV$out$sim.resources
+    data <- activity(res, RV$SystemConfiguration)$df
+    HTML(data %>% kbl() %>% kable_styling(font_size=14))
+  }
+})
+```
+
+### <b>Time</b>
+```{r, echo=FALSE}
+renderUI({
+  if ( ! is.null(RV$out) ) {
+    arr <- RV$out$sim.arrivals
+    HTML(skiers(arr)$df %>% kbl() %>% kable_styling(font_size=14))
+  }
+})
+```
+
+<b>3</b> {data-icon="fa-hockey-puck"}
+=====================================  
+
+Row {}
+-------------------------------------
+### <b>waiting time</b>
+```{r, echo=FALSE}
+renderPlot({
+  if ( ! is.null(RV$out) ) {
+    arr <- RV$out$sim.arrivals
+    skiers(arr)$p.wait
+  }
+})
+```
+
+
+Row {}
+-------------------------------------
+### <b>flow time</b>
+```{r, echo=FALSE}
+renderPlot({
+  if ( ! is.null(RV$out) ) {
+    arr <- RV$out$sim.arrivals
+    skiers(arr)$p.in
+  }
+})
+```
+
+Row {}
+-------------------------------------
+### <b>activity time</b>
+```{r, echo=FALSE}
+renderPlot({
+  if ( ! is.null(RV$out) ) {
+    arr <- RV$out$sim.arrivals
+    skiers(arr)$p.act
+  }
+})
+```
+
+
+<b>4</b> {data-icon="fa-hockey-puck"}
+=====================================  
+
+Row {}
+-------------------------------------
+### <b>*simmer* package</b>
+
+The simulation is built around the R package *simmer* (https://r-simmer.org/).
+
+The basic model construction (called trajectories) consists of 3 steps: seize, timeout, and release.
+
+  - A skier is trying to 'seize' the lift 
+    - 1) access the lift immediately if there is enough capacity.
+    - 2) wait in the queue if there is no room in the lift but there is room in the queue.
+    - 3) reject if there is no room in the queue.
+  
+  - timeout is the service time, an exponential distribution for M/M/1 queues. 
+  - 'release' the resource once the skier is on the lift.
+
+Once on top of the mountain, the same seize, timeout, and release occur. Branches can be added to a trajectory when a decision needs to be made (e.g. choose to leave the mountain or ski again). 
+
+To set up a simulation environment, 
+
+  - add resources. Each resource has a server and a queue.
+  - add generators. Each generator is source of arrivals to a trajectory.
+  - run the environment for a specified time.
+  
+### <b>simulation model</b>
+```{r, echo=FALSE}  
+ renderUI({
+  plot(RV$out$sim.trajectory)
+ })
+```
+
+  
+### <b>*queueing* package</b>
+The *queueing* package provides the main performance measures for a number queuing models, including Open Jackson Networks (OJN) and well-known queues (e.g. M/M/1). Unlike *simmer*, the *queueing* package provides deterministic answers. The steps to get to an answer:
+
+  - define a transition probability matrix (prob)
+  - define queues e.g. NewInput.MMC( lambda,  mu1,  CP1)
+  - define a network, e.g. NewInput.OJN(prob, queue1, queue2)
+  - run the model, QueueingModel()
+  - print output
+
+M/M/c, describes a model in which: 
+
+  - the inter-arrival and service times are both exponential (M is obtained from the Markovian property of the exponential distribution)
+  - there are *c* servers in a facility that does not impose any restriction on the number of customers
+  - customers arrive from a population that is considered infinite in the sense that the arrival of an individual does not modify the probability of the next arrival
+  - FCFS (First Come, First Served) is the most frequent way in which the next customer to be served is chosen from the queue.
+
+
+
+<b>5</b> {data-icon="fa-hockey-puck"}
+=====================================  
+
+Column {}
+-------------------------------------
+### <b>Notes</b>
+
+The simple ski lift problem previously described can be enhanced in many ways via more complex simulation models. Consider the following example.
+
+The ski resort has expanded the mountain to include more ski-able area. The resort management is contemplating the purchase of a second lift to reach all the slopes of the resort, and/or expanding the existing lift system to accommodate an anticipated increase in the number of skiers arriving at the resort (arrival rate L).
+
+The basic lift model is as follows: A skier arrives at the resort, and chooses lift 1 or lift 2. A the top of the lift, the skier chooses one of the available slopes. Once at the bottom of the mountain (blues dots), the skier repeats the process. Each choice implies a probability. We could add skiers leaving the ski area with a given probability.
+
+### <b></b>
+```{r, echo=FALSE}
+
+lifts <- data.frame(rbind(
+  c(x=2., y=3, label="lift 1"),
+  c(x=2., y=7, label="lift 2")
+))
+lifts$x <- as.numeric(lifts$x) 
+lifts$y <- as.numeric(lifts$y) 
+
+slopes <- data.frame(rbind(
+  c(x=4, y=2,  label="slope 1"),
+  c(x=5, y=4,  label="slope 2"),
+  c(x=5, y=6,  label="slope 3"),
+  c(x=4, y=8,  label="slope 4")
+))
+slopes$x <- as.numeric(slopes$x)
+slopes$y <- as.numeric(slopes$y)
+
+segments <- data.frame(rbind(
+  c(x=2, y=3, xend=4, yend=2), # from lift 1 to slope 1
+  c(x=2, y=3, xend=5, yend=4), # from lift 1 to slope 2
+  c(x=2, y=3, xend=5, yend=6), # from lift 1 to slope 3
+  c(x=2, y=3, xend=4, yend=8), # from lift 1 to slope 4
+  
+  c(x=2, y=7, xend=5, yend=6), # from lift 2 to slope 3
+  c(x=2, y=7, xend=4, yend=8), # from lift 2 to slope 4
+  
+  c(x=1, y=3, xend=1, yend=7),
+  c(x=0, y=5, xend=1, yend=5),
+  c(x=1, y=7, xend=2, yend=7),
+  c(x=1, y=3, xend=2, yend=3)
+))
+segments$x <- as.numeric(segments$x)
+segments$y <- as.numeric(segments$y)
+
+prob <- data.frame(rbind(
+  c(x=3.3, y=2,  label="p11"),
+  c(x=4.3, y=4,  label="p12"),
+  c(x=4.3, y=5,  label="p13"),
+  c(x=4.3, y=6,  label="p23"),
+  c(x=3.3, y=8,  label="p24"),
+  
+  c(x= 0, y=5,   label="L"),
+  
+  c(x= 1.3 , y=4,  label="P(lift 1)"),
+  c(x= 1.3 , y=6,  label="P(lift 2)")
+))
+prob$x <- as.numeric(prob$x)
+prob$y <- as.numeric(prob$y)
+
+curves <- data.frame(rbind(
+  c(x=4.2, y=2, xend=0.4, yend=5),  # from slope 1 to start
+  c(x=5.2, y=4, xend=0.4, yend=5),  # from slope 2 to start
+  c(x=5.2, y=6, xend=0.4, yend=5),  # from slope 3 to start
+  c(x=4.2, y=8, xend=0.4, yend=5)   # from slope 4 to start
+))
+curves$x <- as.numeric(curves$x)
+curves$y <- as.numeric(curves$y)
+curvature <- c(-.6, -.8, .8, .6)
+
+
+
+g <- ggplot() + ylim(0, 10) + xlim(0, 6) + theme_void()
+g <- g + geom_text(data=prob, aes(x=x, y=y, label=label))
+g <- g + geom_segment(
+  data=segments, size=1.5, 
+  arrow = arrow(length = unit(0.25,"cm")),
+  aes(x=x, y=y, xend=xend, yend=yend))
+
+for ( j in 1:4 ) {
+  g <- g + geom_curve(
+    data=curves[j,], 
+    color="blue", size=1, linetype="dotted",
+    curvature=curvature[j], 
+    arrow = arrow(length = unit(0.25,"cm")),
+    aes(x=x, y=y, xend=xend, yend=yend))
+}
+
+g <- g + geom_label(data=lifts, aes(x=x, y=y, label=label))
+g <- g + geom_label(data=slopes, aes(x=x, y=y, label=label))
+
+g
+
+```
+
+Row {}
+-------------------------------------
+###
+
+An Open Jackson Network model (https://en.wikipedia.org/wiki/Jackson_network) is often a starting point due to its simpler computational aspects. Anything more complex will require a simulation tool such as *simmer*.  
+
+Since the ski capacity is increased, the alternatives are: 1) buy a new lift system or 2) tune and/or expand the existing lift system. The decision comes down to minimizing costs while maintaining a target level-of-service. The simulation helps determine the set of possible solutions that meet the target level-of-service. The next steps in this analysis would be to formulate a Linear Programming (LP) model to find the solution(s) that minimize costs (acquisition and operational).
+
+###
+```{r, echo=FALSE}
+
+lifts <- data.frame(rbind(
+  c(x=2., y=3, label="lift 1")
+))
+lifts$x <- as.numeric(lifts$x) 
+lifts$y <- as.numeric(lifts$y) 
+
+slopes <- data.frame(rbind(
+  c(x=4, y=2,  label="slope 1"),
+  c(x=5, y=4,  label="slope 2"),
+  c(x=5, y=6,  label="slope 3"),
+  c(x=4, y=8,  label="slope 4")
+))
+slopes$x <- as.numeric(slopes$x)
+slopes$y <- as.numeric(slopes$y)
+
+segments <- data.frame(rbind(
+  c(x=2, y=3, xend=4, yend=2), # from lift 1 to slope 1
+  c(x=2, y=3, xend=5, yend=4), # from lift 1 to slope 2
+  c(x=2, y=3, xend=5, yend=6), # from lift 1 to slope 3
+  c(x=2, y=3, xend=4, yend=8), # from lift 1 to slope 4
+  
+  c(x=1, y=5, xend=1, yend=3),
+  c(x=0, y=5, xend=1, yend=5),
+  c(x=1, y=3, xend=2, yend=3)
+))
+segments$x <- as.numeric(segments$x)
+segments$y <- as.numeric(segments$y)
+
+prob <- data.frame(rbind(
+  c(x=3.3, y=2,  label="p11"),
+  c(x=4.3, y=4,  label="p12"),
+  c(x=4.3, y=5,  label="p13"),
+  c(x=4.3, y=6,  label="p23"),
+  c(x=3.3, y=8,  label="p24"),
+  
+  c(x= 0, y=5,   label="L")
+))
+prob$x <- as.numeric(prob$x)
+prob$y <- as.numeric(prob$y)
+
+curves <- data.frame(rbind(
+  c(x=4.2, y=2, xend=0.4, yend=5),  # from slope 1 to start
+  c(x=5.2, y=4, xend=0.4, yend=5),  # from slope 2 to start
+  c(x=5.2, y=6, xend=0.4, yend=5),  # from slope 3 to start
+  c(x=4.2, y=8, xend=0.4, yend=5)   # from slope 4 to start
+))
+curves$x <- as.numeric(curves$x)
+curves$y <- as.numeric(curves$y)
+curvature <- c(-.6, -.8, .8, .6)
+
+
+
+g <- ggplot() + ylim(0, 10) + xlim(0, 6) + theme_void()
+g <- g + geom_text(data=prob, aes(x=x, y=y, label=label))
+g <- g + geom_segment(
+  data=segments, size=1.5, 
+  arrow = arrow(length = unit(0.25,"cm")),
+  aes(x=x, y=y, xend=xend, yend=yend))
+
+for ( j in 1:4 ) {
+  g <- g + geom_curve(
+    data=curves[j,], 
+    color="blue", size=1, linetype="dotted",
+    curvature=curvature[j], 
+    arrow = arrow(length = unit(0.25,"cm")),
+    aes(x=x, y=y, xend=xend, yend=yend))
+}
+
+g <- g + geom_label(data=lifts, aes(x=x, y=y, label=label))
+g <- g + geom_label(data=slopes, aes(x=x, y=y, label=label))
+
+g
+
+```
